@@ -10696,6 +10696,175 @@ def test_mirror_slash_side_effects_rejects_mutating_commands_while_running(monke
     assert not applied["compress"], "compress fired despite running session"
 
 
+def test_mirror_slash_fast_applies_scoped_mode_to_live_agent(monkeypatch):
+    agent = types.SimpleNamespace(
+        service_tier="priority",
+        request_overrides={"foo": "bar", "service_tier": "priority", "speed": "fast"},
+    )
+    session = _session(agent=agent)
+    emitted = []
+    persisted = []
+    writes = []
+    monkeypatch.setitem(server._sessions, "sid", session)
+    monkeypatch.setattr(
+        server, "_write_config_key", lambda path, value: writes.append((path, value))
+    )
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda current, _session: {"fast": current.service_tier == "priority"},
+    )
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(
+        server, "_persist_live_session_runtime", lambda current: persisted.append(current)
+    )
+
+    warning = server._mirror_slash_side_effects(
+        "sid", session, "/fast normal --global"
+    )
+
+    assert warning == ""
+    assert agent.service_tier is None
+    assert agent.request_overrides == {"foo": "bar"}
+    assert session["create_service_tier_override"] == ""
+    assert writes == []
+    assert persisted == [session]
+    assert emitted == [("session.info", "sid", {"fast": False})]
+
+
+def test_slash_exec_fast_mirror_rejects_replaced_session(monkeypatch):
+    stale_agent = types.SimpleNamespace(
+        model="gpt-5.4",
+        service_tier="priority",
+        request_overrides={"service_tier": "priority"},
+    )
+    replacement_agent = types.SimpleNamespace(service_tier="priority")
+    replacement = _session(agent=replacement_agent)
+    writes = []
+    emitted = []
+
+    class _ReplacingWorker:
+        def run(self, _command):
+            writes.append(("worker", "normal"))
+            with server._sessions_lock:
+                server._sessions["sid"] = replacement
+            return "Priority Processing set to NORMAL (saved to config)"
+
+    stale = _session(agent=stale_agent, slash_worker=_ReplacingWorker())
+    monkeypatch.setitem(server._sessions, "sid", stale)
+    monkeypatch.setattr(
+        server,
+        "_write_config_key",
+        lambda _path, value: writes.append(("mirror", value)),
+    )
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+    response = server.handle_request(
+        {
+            "id": "1",
+            "method": "slash.exec",
+            "params": {"session_id": "sid", "command": "/fast normal --global"},
+        }
+    )
+
+    assert response["result"]["warning"] == "session no longer active"
+    assert writes == [("worker", "normal")]
+    assert stale_agent.service_tier == "priority"
+    assert stale_agent.request_overrides == {"service_tier": "priority"}
+    assert "create_service_tier_override" not in stale
+    assert replacement_agent.service_tier == "priority"
+    assert emitted == []
+
+
+def test_slash_exec_fast_mirror_serializes_persistence_before_replacement(monkeypatch):
+    live_agent = types.SimpleNamespace(
+        model="gpt-5.4",
+        service_tier="priority",
+        request_overrides={"service_tier": "priority"},
+    )
+    replacement_agent = types.SimpleNamespace(service_tier="priority")
+    replacement = _session(agent=replacement_agent)
+    writes = []
+    emitted = []
+    persisted = []
+    persist_started = threading.Event()
+    release_persist = threading.Event()
+    replace_started = threading.Event()
+    replaced = threading.Event()
+
+    class _Worker:
+        def run(self, _command):
+            writes.append(("worker", "normal"))
+            return "Priority Processing set to NORMAL (saved to config)"
+
+    live = _session(agent=live_agent, slash_worker=_Worker())
+    monkeypatch.setitem(server._sessions, "sid", live)
+    monkeypatch.setattr(
+        server,
+        "_write_config_key",
+        lambda _path, value: writes.append(("mirror", value)),
+    )
+
+    def _persist(current):
+        persist_started.set()
+        assert release_persist.wait(timeout=2.0)
+        persisted.append(current)
+
+    monkeypatch.setattr(server, "_persist_live_session_runtime", _persist)
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda current, _session: {"fast": current.service_tier == "priority"},
+    )
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    response = {}
+
+    def _run_slash():
+        response.update(
+            server.handle_request(
+                {
+                    "id": "1",
+                    "method": "slash.exec",
+                    "params": {"session_id": "sid", "command": "/fast normal --global"},
+                }
+            )
+        )
+
+    def _replace():
+        replace_started.set()
+        with server._sessions_lock:
+            server._sessions["sid"] = replacement
+        replaced.set()
+
+    slash_thread = threading.Thread(target=_run_slash)
+    replace_thread = threading.Thread(target=_replace)
+    slash_thread.start()
+    assert persist_started.wait(timeout=2.0)
+    replace_thread.start()
+    try:
+        assert replace_started.wait(timeout=2.0)
+        assert not replaced.wait(timeout=0.05)
+        release_persist.set()
+        slash_thread.join(timeout=2.0)
+        replace_thread.join(timeout=2.0)
+    finally:
+        release_persist.set()
+        slash_thread.join(timeout=2.0)
+        replace_thread.join(timeout=2.0)
+
+    assert not slash_thread.is_alive()
+    assert not replace_thread.is_alive()
+    assert response["result"].get("warning") is None
+    assert writes == [("worker", "normal")]
+    assert persisted == [live]
+    assert live_agent.service_tier is None
+    assert live_agent.request_overrides == {}
+    assert live["create_service_tier_override"] == ""
+    assert replacement_agent.service_tier == "priority"
+    assert emitted == [("session.info", "sid", {"fast": False})]
+    assert server._sessions["sid"] is replacement
+
+
 def test_mirror_slash_side_effects_allowed_when_idle(monkeypatch):
     """Regression guard: idle session still runs the side effects."""
     import types

@@ -10845,9 +10845,11 @@ def _respond(rid, params, key, *, allow_expired=False):
 # opt/model-resolution-core PR touches its body; move it to methods_config.py
 # in a follow-up once that PR lands.
 @method("config.set")
-def _(rid, params: dict) -> dict:
+def _config_set(rid, params: dict, *, expected_session: dict | None = None) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
-    session = _sessions.get(params.get("session_id", ""))
+    session_id = str(params.get("session_id") or "")
+    with _sessions_lock:
+        session = _sessions.get(session_id)
 
     if key == "model":
         try:
@@ -10941,6 +10943,8 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 5001, str(e))
 
     if key == "fast":
+        if expected_session is not None and session is not expected_session:
+            return _err(rid, 4001, "session no longer active")
         raw = str(value or "").strip().lower()
         agent = session.get("agent") if session else None
         if agent is not None:
@@ -10999,33 +11003,38 @@ def _(rid, params: dict) -> dict:
                 )
 
         if session is not None:
-            # Session-scoped, like `reasoning` below (global persistence is
-            # `--global` / Settings → Model territory). Writing config.yaml
-            # here let every desktop model-menu selection (per-model fast
-            # preset) rewrite the user's global agent.service_tier — flipping
-            # fast mode for every OTHER session, profile, CLI, and gateway
-            # build ("switch one session, switches everywhere"). Pin the
-            # create override so lazily-built sessions and rebuilds (/new,
-            # deferred resume) keep the choice; "" pins normal explicitly.
-            session["create_service_tier_override"] = (
-                "priority" if nv == "fast" else ""
-            )
+            # Session lifecycle is the _sessions registry entry. Keep the
+            # complete update under its ownership lock so close/replacement
+            # cannot detach the record between mutation, durable persistence,
+            # and the session.info event.
+            with _sessions_lock:
+                if _sessions.get(session_id) is not session:
+                    return _err(rid, 4001, "session no longer active")
+                # Session-scoped, like `reasoning` below (global persistence is
+                # `--global` / Settings → Model territory). Writing config.yaml
+                # here let every desktop model-menu selection (per-model fast
+                # preset) rewrite the user's global agent.service_tier — flipping
+                # fast mode for every OTHER session, profile, CLI, and gateway
+                # build ("switch one session, switches everywhere"). Pin the
+                # create override so lazily-built sessions and rebuilds (/new,
+                # deferred resume) keep the choice; "" pins normal explicitly.
+                session["create_service_tier_override"] = (
+                    "priority" if nv == "fast" else ""
+                )
+                if agent is not None:
+                    agent.service_tier = "priority" if nv == "fast" else None
+                    current_overrides = dict(
+                        getattr(agent, "request_overrides", {}) or {}
+                    )
+                    current_overrides.pop("service_tier", None)
+                    current_overrides.pop("speed", None)
+                    if nv == "fast":
+                        current_overrides.update(overrides)
+                    agent.request_overrides = current_overrides
+                    _persist_live_session_runtime(session)
+                    _emit("session.info", session_id, _session_info(agent, session))
         else:
             _write_config_key("agent.service_tier", nv)
-        if agent is not None:
-            agent.service_tier = "priority" if nv == "fast" else None
-            current_overrides = dict(getattr(agent, "request_overrides", {}) or {})
-            current_overrides.pop("service_tier", None)
-            current_overrides.pop("speed", None)
-            if nv == "fast":
-                current_overrides.update(overrides)
-            agent.request_overrides = current_overrides
-            _persist_live_session_runtime(session)
-            _emit(
-                "session.info",
-                params.get("session_id", ""),
-                _session_info(agent, session),
-            )
         return _ok(rid, {"key": key, "value": nv})
 
     if key == "busy":
@@ -13028,12 +13037,21 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             )
             return "\n".join(_lines)
         elif name == "fast" and agent:
-            mode = arg.lower()
-            if mode in {"fast", "on"}:
-                agent.service_tier = "priority"
-            elif mode in {"normal", "off"}:
-                agent.service_tier = None
-            _emit("session.info", sid, _session_info(agent, session))
+            mode = " ".join(
+                token
+                for token in arg.lower().split()
+                if token not in {"--global", "--session"}
+            )
+            if mode in {"fast", "on", "normal", "off"}:
+                # Reuse config.set's session pin, request-override cleanup,
+                # persistence, validation, and session.info emission.
+                response = _config_set(
+                    None,
+                    {"session_id": sid, "key": "fast", "value": mode},
+                    expected_session=session,
+                )
+                if error := response.get("error"):
+                    return str(error.get("message") or "fast mode update failed")
         elif name == "reload-mcp" and agent and hasattr(agent, "reload_mcp_tools"):
             agent.reload_mcp_tools()
         elif name == "stop":
