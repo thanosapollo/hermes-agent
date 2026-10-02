@@ -1925,6 +1925,11 @@ class GatewayTurnMixin:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
             response = ""
 
+        if agent_result.get("queued_delivery_incomplete"):
+            event._queued_delivery_incomplete = True
+        if agent_result.get("delivery_incomplete") is not None:
+            event._delivery_incomplete = agent_result["delivery_incomplete"]
+            return None  # accepted prefix: no whole-response replay, voice or media fallback
         adapter = self._delivery_adapter_for(source)
         # Auto voice reply (TTS audio before the text) unless streaming TTS already delivered audio.
         _streaming_tts_done = adapter is not None and bool(
@@ -3746,6 +3751,7 @@ class GatewayTurnMixin:
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
                     session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                    delivery_result=result if isinstance(result, dict) else None,
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
@@ -3919,6 +3925,11 @@ class GatewayTurnMixin:
         await _run_followup_processing_hook(
             _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
         merged = _preserve_queued_followup_history_offset(result, followup_result)
+        if isinstance(merged, dict) and (result.get("delivery_incomplete") is not None
+                                        or result.get("queued_delivery_incomplete")):
+            # The first input's incomplete receipt affects its processing outcome,
+            # not the terminal input's independent delivery decision.
+            merged = {**merged, "queued_delivery_incomplete": True}
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal
         # reply is recorded under the first message's id, so a first reply that was refused (flood
@@ -3984,17 +3995,35 @@ class GatewayTurnMixin:
 
     async def _run_agent_edit_streamed_message(
         self, _sc, source, response, content, *, _sk, ok, fail_result: str, fail_exc: str,
+        inbound_message_id: Optional[str] = None,
     ) -> None:
         """Edit the stream consumer's message in place with ``content``; on success mark
         ``response["already_sent"]`` and log ``ok``. A returned failure logs ``fail_result`` as
         ``(session, error)`` and an exception logs ``fail_exc`` as ``(session, exc)``; either way
-        ``already_sent`` stays unset so the normal final send delivers the content."""
+        ``already_sent`` stays unset so the normal final send delivers the content.
+        An accepted partial instead conserves its exact obligation and suppresses
+        whole-response fallback without claiming delivery succeeded."""
+        if response.get("delivery_incomplete") is not None:
+            return
         try:
-            _res = await _sc.adapter.edit_message(
-                chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,
-            )
+            from gateway.stream_consumer import GatewayStreamConsumer
+            if isinstance(_sc, GatewayStreamConsumer):
+                _res = await _sc._edit_message(message_id=_sc.message_id, content=content, finalize=True)
+            else:
+                _res = await _sc.adapter.edit_message(
+                    chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,
+                )
         except Exception as _edit_err:
             logger.warning(fail_exc, _sk, _edit_err)
+            return
+        if BasePlatformAdapter._is_partial_delivery(_res):
+            response["delivery_incomplete"] = _res
+            response.pop("already_sent", None)
+            response.pop("media_already_delivered", None)
+            if isinstance(_sc.adapter, BasePlatformAdapter):
+                await _sc.adapter.conserve_final_receipt(
+                    MessageEvent(text="", source=source, ledger_message_id=inbound_message_id),
+                    _sk, content, _res)
             return
         if not getattr(_res, "success", True):
             logger.warning(fail_result, _sk, getattr(_res, "error", None))
@@ -4010,7 +4039,8 @@ class GatewayTurnMixin:
         payload: a mismatch (False, incl. payload-less split delivery) never suppresses; None (no
         record) keeps legacy trust."""
         _sc, source, session_key = turn_ctx.stream_consumer_holder[0], turn_ctx.source, turn_ctx.session_key
-        if not isinstance(response, dict) or response.get("failed"):
+        if (not isinstance(response, dict) or response.get("failed")
+                or response.get("delivery_incomplete") is not None):
             return
         _final = response.get("final_response") or ""
         _is_empty_sentinel = not _final or _final == "(empty)"
@@ -4059,6 +4089,7 @@ class GatewayTurnMixin:
             elif _sc_msg_id and _sc_msg_id != "__no_edit__" and getattr(_sc, "adapter", None) is not None:
                 await self._run_agent_edit_streamed_message(
                     _sc, source, response, _final, _sk=_sk,
+                    inbound_message_id=turn_ctx.inbound_message_id,
                     ok=("Reconciled stale streamed finalize for session %s: edited message %s with the complete response (#71643).", _sk, _sc_msg_id),
                     fail_result="Stale-finalize reconciliation edit failed for session %s (%s); sending complete response via normal final send.",
                     fail_exc="Stale-finalize reconciliation edit failed for session %s: %s; sending complete response via normal final send.",
@@ -4070,9 +4101,10 @@ class GatewayTurnMixin:
                 )
         elif _transformed and _sc is not None:
             # Transformed after streaming: edit the streamed message instead of sending a duplicate.
-            if _sc.message_id:
+            if _sc.message_id and not getattr(_sc, "_turn_split_delivery", False):
                 await self._run_agent_edit_streamed_message(
                     _sc, source, response, response["final_response"], _sk=_sk,
+                    inbound_message_id=turn_ctx.inbound_message_id,
                     ok=("Edited streamed message %s for session %s to include plugin-transformed content.", _sc.message_id, _sk),
                     fail_result="Transformed-final edit failed for session %s (%s); sending transformed response via normal final send.",
                     fail_exc="Failed to edit streamed message for session %s: %s",

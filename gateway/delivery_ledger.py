@@ -2,7 +2,9 @@
 WAL, owner pid + process-start liveness, bounded retention) so a crash between finalize and
 platform ACK cannot lose a response silently. Checkpoints: record_obligation() 'pending' before
 any send | mark_attempting() 'attempting' right before the await | mark_delivered() 'delivered'
-only on SendResult.success | mark_failed() 'failed' on a definitive rejection. Crash semantics
+on SendResult.success | mark_failed() 'failed' on a definitive rejection.
+An acquired post-stream reconciliation partial is admitted 'incomplete': its accepted prefix
+must not be replayed, and its full content is retained under the original obligation. Crash semantics
 (never silently resend an ambiguous send): pending = never started, redeliver plainly; attempting
 = crashed mid-await, platform MAY have it, redeliver WITH a visible recovered marker; failed =
 rejected once, restart is a retry boundary, also marked; delivered = prune. Attempts are capped
@@ -268,18 +270,34 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
 
 
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
-                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
-    """Record a final response as owed to the platform (state='pending')."""
+                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
+                      incomplete_error: Optional[str] = None) -> None:
+    """Record an owed final, or atomically conserve an acquired incomplete receipt.
+
+    Incomplete finals have an accepted prefix but no durable tail replay contract.
+    Keep their full content without admitting a replayable intermediate state.
+    Exact-id readmission must not erase that evidence.
+    """
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO delivery_obligations
+            """INSERT INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, adapter_profile)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, adapter_profile, last_error)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(obligation_id) DO UPDATE SET
+                 session_key=excluded.session_key, platform=excluded.platform,
+                 chat_id=excluded.chat_id, thread_id=excluded.thread_id, content=excluded.content,
+                 state=excluded.state, attempts=0, created_at=excluded.created_at,
+                 updated_at=excluded.updated_at, owner_pid=excluded.owner_pid,
+                 owner_started_at=excluded.owner_started_at,
+                 adapter_profile=excluded.adapter_profile, last_error=excluded.last_error
+               WHERE delivery_obligations.state != 'incomplete'""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
+             content, 'incomplete' if incomplete_error is not None else 'pending', now, now, pid, started,
+             str(adapter_profile).strip() if adapter_profile else "default",
+             incomplete_error[:500] if incomplete_error is not None else None))
         # Same transaction, same connection: the cron ledgers prune this way too
         # (cron/delivery_queue._prune_terminal_unlocked, cron/executions._prune_unlocked).
         _prune_unlocked(conn, now)
@@ -319,6 +337,13 @@ def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
 
 
+def incomplete_obligation(obligation_id: str) -> bool:
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute("SELECT state FROM delivery_obligations WHERE obligation_id=?",
+                           (obligation_id,)).fetchone()
+    return bool(row and row[0] == "incomplete")
+
+
 def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
     """Return an unsent runtime claim to ``failed`` without spending an attempt.
 
@@ -345,7 +370,7 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
         conn.execute(
             """UPDATE delivery_obligations
                SET state=?, updated_at=?, last_error=?
-               WHERE obligation_id=?""",
+               WHERE obligation_id=? AND state != 'incomplete'""",
             (state, time.time(), error[:500] if error else None, obligation_id))
 
 
@@ -538,7 +563,7 @@ def _prune_unlocked(conn, now: float) -> None:
     """Retention DELETEs on the caller's open connection — must run inside the caller's transaction."""
     conn.execute(
         """DELETE FROM delivery_obligations
-           WHERE state IN ('delivered', 'abandoned') AND updated_at < ?""", (now - _RETENTION_SECONDS,))
+           WHERE state IN ('delivered', 'abandoned', 'incomplete') AND updated_at < ?""", (now - _RETENTION_SECONDS,))
     total = conn.execute("SELECT COUNT(*) FROM delivery_obligations").fetchone()[0]
     if total > _MAX_ROWS:
         conn.execute(
@@ -547,6 +572,7 @@ def _prune_unlocked(conn, now: float) -> None:
                  ORDER BY CASE state
                             WHEN 'delivered' THEN 0
                             WHEN 'abandoned' THEN 1
+                            WHEN 'incomplete' THEN 1
                             ELSE 2
                           END, updated_at ASC
                  LIMIT ?)""", (total - _MAX_ROWS,))

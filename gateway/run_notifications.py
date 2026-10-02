@@ -413,6 +413,7 @@ class GatewayNotificationsMixin:
         metadata: Optional[Dict[str, Any]] = None, event_message_id: Optional[str] = None,
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         session_key: Optional[str] = None, inbound_message_id: Optional[str] = None,
+        delivery_result: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Deliver a queued response using the normal text+attachment split.
 
@@ -425,8 +426,12 @@ class GatewayNotificationsMixin:
         already delivered it, the reconcile edit landed, the send succeeded, or there was nothing
         textual to send. False: the send was REFUSED (flood control, dead transport) — the caller
         must leave the normal completion send as the fallback, or the user gets nothing. A connector
-        DECLINE returns True: that destination is not approved and must not be re-sent."""
+        DECLINE returns True: that destination is not approved and must not be re-sent.
+        A partial post-stream reconciliation returns False and conserves its receipt in ``delivery_result``:
+        it is neither complete nor safe for a whole-response fallback."""
         from gateway.run import _strip_response_attachments_for_direct_send
+        if delivery_result is not None and delivery_result.get("delivery_incomplete") is not None:
+            return False
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
@@ -440,9 +445,26 @@ class GatewayNotificationsMixin:
                     and not getattr(stream_consumer, "_turn_split_delivery", False)
                 ):
                     try:
-                        _edit_res = await adapter.edit_message(
-                            chat_id=source.chat_id, message_id=_sc_msg_id, content=text_content, finalize=True,
-                        )
+                        from gateway.stream_consumer import GatewayStreamConsumer
+                        _receipt_owner = adapter
+                        if isinstance(stream_consumer, GatewayStreamConsumer):
+                            _receipt_owner = stream_consumer.adapter
+                            _edit_res = await stream_consumer._edit_message(
+                                message_id=_sc_msg_id, content=text_content, finalize=True)
+                        else:
+                            _edit_res = await adapter.edit_message(
+                                chat_id=source.chat_id, message_id=_sc_msg_id, content=text_content, finalize=True,
+                            )
+                        if BasePlatformAdapter._is_partial_delivery(_edit_res):
+                            if delivery_result is not None:
+                                delivery_result["delivery_incomplete"] = _edit_res
+                                delivery_result.pop("already_sent", None)
+                                delivery_result.pop("media_already_delivered", None)
+                            if session_key and isinstance(_receipt_owner, BasePlatformAdapter):
+                                await _receipt_owner.conserve_final_receipt(
+                                    MessageEvent(text="", source=source, ledger_message_id=inbound_message_id),
+                                    session_key, text_content, _edit_res)
+                            return False
                         if getattr(_edit_res, "success", False):
                             _reconciled = True
                             logger.info(

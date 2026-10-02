@@ -4225,10 +4225,13 @@ class BasePlatformAdapter(ABC):
 
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
-        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool) -> Optional[str]:
-        """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
-        next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
-        or None."""
+        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool, *,
+        incomplete_result: Any = None) -> Optional[str]:
+        """Admit final debt before send, or atomically conserve acquired reconciliation debt.
+
+        Ordinary admission stays replayable for crash recovery; an acquired post-stream partial
+        is admitted incomplete. Best-effort, skips slash-command and ephemeral replies.
+        Returns the obligation id or None."""
         if is_ephemeral_response or str(event.text or "").lstrip().startswith(
             ("/", self.typed_command_prefix or "!")):
             return None
@@ -4250,8 +4253,11 @@ class BasePlatformAdapter(ABC):
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
                 content=text_content,
-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
-            await asyncio.to_thread(mark_attempting, obligation_id)
+                adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
+                **({"incomplete_error": str(getattr(incomplete_result, "error", "") or "partial_delivery")}
+                   if incomplete_result is not None else {}))
+            if incomplete_result is None:
+                await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:
             logger.debug("delivery ledger record failed", exc_info=True)
@@ -4356,6 +4362,43 @@ class BasePlatformAdapter(ABC):
             return
         record_delivery(result)
 
+    @staticmethod
+    async def _await_receipt_settlement(settlement) -> Any:
+        """Settle an acquired receipt before propagating even repeated caller cancellation.
+
+        The caller owns this child until it is terminal. Shield every wait; an
+        unshielded second await can cancel queued to_thread admission. Preserve
+        the first caller cancellation, but do not spin on a self-cancelled child.
+        Persistence errors retain the ledger's existing best-effort policy.
+        """
+        child = asyncio.create_task(settlement)
+        cancellation = None
+        caller = asyncio.current_task()
+        try:
+            while not child.done():
+                try:
+                    await asyncio.shield(child)
+                except asyncio.CancelledError as exc:
+                    if cancellation is None and caller is not None and caller.cancelling():
+                        cancellation = exc
+            return child.result()
+        finally:
+            if cancellation is not None:
+                raise cancellation
+
+    async def conserve_final_receipt(
+        self, event: MessageEvent, session_key: str, content: str, result: Any,
+    ) -> None:
+        """Conserve a final reconciliation's accepted prefix under its original input.
+
+        Only final receipts belong here: interim clipped previews still use the
+        stream consumer's native tail recovery. No whole-head fallback is safe
+        after this final reconciliation has acquired partial delivery evidence.
+        """
+        event._delivery_incomplete = result
+        await self._await_receipt_settlement(self._record_delivery_obligation(
+            event, session_key, content, self, False, incomplete_result=result))
+
     async def send_final_ledgered(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any], *,
         reply_to: Optional[str], is_ephemeral_response: bool = False,
@@ -4374,11 +4417,27 @@ class BasePlatformAdapter(ABC):
             event, session_key, text_content, delivery_adapter, is_ephemeral_response)
         if obligation_id is not None:
             await self._release_turn_marker(event)  # the ledger now owns the crash recovery
+        if obligation_id is not None:
+            try:
+                from gateway.delivery_ledger import incomplete_obligation
+                if await asyncio.to_thread(incomplete_obligation, obligation_id):
+                    result = SendResult(success=False, error="partial_delivery",
+                                        raw_response={"partial_overflow": True})
+                    event._delivery_incomplete = result
+                    return result, delivery_adapter
+            except Exception:
+                logger.debug("delivery ledger disposition lookup failed", exc_info=True)
         result = await delivery_adapter._send_with_retry(
             chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         stop_reply_clock(delivery_adapter, event.source.chat_id, result)
         if obligation_id is not None:
-            await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
+            settlement = self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
+            # Only a complete acquired ACK owns cancellation-resistant final settlement.
+            # Ordinary partial disposition and recovery retain their existing policy.
+            if getattr(result, "success", False) and not self._is_partial_delivery(result):
+                await self._await_receipt_settlement(settlement)
+            else:
+                await settlement
         return result, delivery_adapter
 
     async def _release_turn_marker(self, event: MessageEvent) -> None:
@@ -4617,7 +4676,9 @@ class BasePlatformAdapter(ABC):
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
             await self._release_turn_marker(event)
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            processing_ok = (delivery_succeeded if delivery_attempted else not bool(response)) and not (
+                getattr(event, "_delivery_incomplete", None) is not None
+                or getattr(event, "_queued_delivery_incomplete", False))
             # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
                 session_key, getattr(interrupt_event, "_hermes_run_generation", None),
